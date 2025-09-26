@@ -1,143 +1,243 @@
-<!doctype html>
-<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Virtual Jewels Try-On</title>
-<!-- NOTE: For real secrecy, host product images & logic on a server and return short-lived URLs. -->
-<link href="https://fonts.googleapis.com/css2?family=Cinzel&family=Poppins&display=swap" rel="stylesheet">
-<style>@import url('https://fonts.googleapis.com/css2?family=Cinzel&family=Poppins&display=swap');*{margin:0;padding:0;box-sizing:border-box}html,body{height:100%;width:100%;background:#0b0b0b;color:#fff;font-family:'Poppins',sans-serif}video,canvas{position:fixed;top:0;left:0;width:100vw;height:100vh;object-fit:cover;z-index:1}#branding{position:fixed;top:21px;left:20px;padding:8px 12px;border-radius:10px;display:flex;align-items:center;z-index:5;font-family:'Cinzel',serif;font-size:24px;color:#000}#branding img{width:80px;height:auto;margin-right:10px}.ui-buttons{position:fixed;top:20px;right:20px;display:flex;gap:15px;z-index:5}.ui-buttons button,.ui-buttons a{background:rgba(255,255,255,0.12);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,0.18);border-radius:50%;width:50px;height:50px;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:all .25s}.ui-buttons img{width:25px;height:25px}</style>
-<!-- Mediapipe libs (must be accessible by client) -->
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
-</head><body>
-<div class="video-container">
-  <video id="webcam" autoplay muted playsinline></video>
-  <canvas id="overlay"></canvas>
-</div>
-<div id="branding"><img src="logo.png" alt="logo"/><span style="color:#fff">Fine Gold</span></div>
-<div class="ui-buttons"><a id="loc" href="https://maps.app.goo.gl/gsTuBCVMUVk9cxYZ6" target="_blank" rel="noopener noreferrer"><img src="location_icon.png" alt="loc"/></a></div>
+const videoElement = document.getElementById('webcam');
+const canvasElement = document.getElementById('overlay');
+const canvasCtx = canvasElement.getContext('2d');
 
-<script>
-/*
-  QUICK SECURITY NOTES:
-   - This obfuscation is only to slow casual copying.
-   - Move any real secrets (private product URLs, API keys) to a server and return ephemeral URLs.
-   - To change the default product: decode the BASE64_PRODUCT string below and replace with your Google Drive thumbnail link,
-     or ideally, change it on the server.
-*/
+const subcategoryButtons = document.getElementById('subcategory-buttons');
+const jewelryOptions = document.getElementById('jewelry-options');
 
-(function(){
-  // ----- config (base64 encoded strings to hide plain text) -----
-  var B="aHR0cHM6Ly9kcml2ZS5nb29nbGUuY29tL3RodW1ibmFpbD9pZD1ZT1VSX1BST0RDX0lEXyZzej13MTAwMA=="; 
-  // Above is base64 for: https://drive.google.com/thumbnail?id=YOUR_PRODUCT_ID&sz=w1000
-  // Replace the base64 string with your own encoded URL if needed.
-  // Example: btoa('https://drive.google.com/thumbnail?id=YOUR_PRODUCT_ID&sz=w1000')
+let earringImg = null;
+let necklaceImg = null;
 
-  // Lightweight utilities (minified-style)
-  var d=document, w=window;
-  function g(id){return d.getElementById(id);}
-  function atobSafe(s){try{return atob(s)}catch(e){return ''}}
-  function noop(){}
+let currentType = '';
+let smoothedFaceLandmarks = null;
+let camera;
 
-  // Anti-inspect: disable common keys + right-click
-  d.addEventListener('contextmenu',function(e){e.preventDefault()},false);
-  d.addEventListener('keydown',function(e){
-    // F12, Ctrl+Shift+I/J, Ctrl+U
-    if(e.keyCode===123 || (e.ctrlKey && e.shiftKey && (e.keyCode===73||e.keyCode===74)) || (e.ctrlKey && e.keyCode===85)){ e.preventDefault(); e.stopPropagation(); }
-  },false);
+// Store smoothed jewelry positions
+let smoothedFacePoints = {};
 
-  // Basic devtools detector — reloads to frustrate rapid inspection (not foolproof)
-  var lastOpen=0;
-  setInterval(function(){
-    try{
-      var widthDiff = w.outerWidth - w.innerWidth;
-      var heightDiff = w.outerHeight - w.innerHeight;
-      if((widthDiff>160 || heightDiff>160) && Date.now()-lastOpen>2000){
-        lastOpen=Date.now();
-        try{ w.location.reload(); }catch(err){}
-      }
-    }catch(err){}
-  },800);
+// ================== GOOGLE DRIVE CONFIG ==================
+const API_KEY = "AIzaSyCOkk8w6DyEp5lwdm5DjECSo-c2Xitw9vI"; 
 
-  // DOM references
-  var vEl=g('webcam'), cEl=g('overlay'), ctx=cEl.getContext('2d');
-  var productImg=null;
-  var smoothed=null, cameraObj=null, smoothedPoints={};
+// Map jewelry type → Google Drive Folder ID
+const driveFolders = {
+  gold_earrings: "16q2qkfEmeyMa45edfuRGwhJskQEbiwFS",
+  gold_necklaces: "1yiCBSMk4HpxxZcPf2AQeQeAKMcNNQNxt",
+  diamond_earrings: "177PssOxA552FjZS6OjtMpz-tRZzJuL26",
+  diamond_necklaces: "1ffu4kbZMpWhw4bOLnB07z-HM8E5Lz7qz",
+};
 
-  // minimal image loader using base64-obfuscated URL
-  (function loadDefault(){
-    var url=atobSafe(B);
-    if(!url) return;
-    var im=new Image();
-    im.crossOrigin='anonymous';
-    im.onload=function(){ productImg=im }
-    im.onerror=function(){ /* swallow */ }
-    im.src=url;
-  })();
+// Fetch image links from a Drive folder
+async function fetchDriveImages(folderId) {
+  const url = `https://www.googleapis.com/drive/v3/files?q='${folderId}'+in+parents&key=${API_KEY}&fields=files(id,name,mimeType)`;
+  const res = await fetch(url);
+  const data = await res.json();
 
-  // faceMesh setup (mediapipe)
-  var FaceMesh = self.FaceMesh;
-  if(!FaceMesh){ console.warn('mediapipe not loaded'); }
-  var fm = new FaceMesh({ locateFile: function(f){ return 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/'+f }});
-  fm.setOptions({maxNumFaces:1,refineLandmarks:true,minDetectionConfidence:.6,minTrackingConfidence:.6});
-  fm.onResults(function(res){
-    ctx.clearRect(0,0,cEl.width,cEl.height);
-    if(res.multiFaceLandmarks && res.multiFaceLandmarks.length>0){
-      var newL = res.multiFaceLandmarks[0];
-      if(!smoothed) smoothed=newL;
-      else{
-        var f=0.18;
-        for(var i=0;i<newL.length;i++){
-          smoothed[i]={x: smoothed[i].x*(1-f)+newL[i].x*f, y: smoothed[i].y*(1-f)+newL[i].y*f, z: smoothed[i].z*(1-f)+newL[i].z*f};
-        }
-      }
-    } else { smoothed=null }
-    draw(smoothed, ctx);
-  });
+  if (!data.files) return [];
 
-  // start camera
-  function startCamera(facingMode){
-    try{ if(cameraObj) cameraObj.stop(); }catch(e){}
-    cameraObj = new Camera(vEl, {
-      onFrame: async function(){ await fm.send({image: vEl}); },
-      width:1280, height:720, facingMode:facingMode || 'user'
+  return data.files
+    .filter(f => f.mimeType.includes("image/"))
+    .map(f => {
+      const link = `https://drive.google.com/thumbnail?id=${f.id}&sz=w1000`;
+      return { id: f.id, name: f.name, src: link };
     });
-    cameraObj.start();
-  }
+}
 
-  // set canvas size once metadata loads
-  vEl.addEventListener('loadedmetadata', function(){
-    try{ cEl.width = vEl.videoWidth; cEl.height = vEl.videoHeight }catch(e){}
+// Utility function to load images
+async function loadImage(src) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => {
+      console.error(`Failed to load image: ${src}`);
+      resolve(null);
+    };
+    img.src = src;
   });
+}
 
-  // smoothing helper
-  function sp(prev, cur, f){ if(!prev) return cur; return {x: prev.x*(1-f)+cur.x*f, y: prev.y*(1-f)+cur.y*f}; }
+// Change jewelry image
+async function changeJewelry(type, src) {
+  const img = await loadImage(src);
+  if (!img) return;
 
-  // draw jewelry (ears)
-  function draw(land, ctx){
-    if(!land || !productImg) return;
-    try{
-      var left = land[132], right = land[361];
-      var lx = left.x*cEl.width - 6, ly = left.y*cEl.height - 16;
-      var rx = right.x*cEl.width + 6, ry = right.y*cEl.height - 16;
-      smoothedPoints.leftEar = sp(smoothedPoints.leftEar, {x:lx,y:ly}, 0.42);
-      smoothedPoints.rightEar = sp(smoothedPoints.rightEar, {x:rx,y:ry}, 0.42);
-      var scale = 0.078;
-      var w = productImg.width * scale, h = productImg.height * scale;
-      ctx.drawImage(productImg, smoothedPoints.leftEar.x - w/2, smoothedPoints.leftEar.y, w, h);
-      ctx.drawImage(productImg, smoothedPoints.rightEar.x - w/2, smoothedPoints.rightEar.y, w, h);
-    }catch(err){}
+  earringImg = necklaceImg = null;
+
+  if (type.includes('earrings')) earringImg = img;
+  else if (type.includes('necklaces')) necklaceImg = img;
+}
+
+// Handle category selection
+function toggleCategory(category) {
+  jewelryOptions.style.display = 'none';
+  subcategoryButtons.style.display = 'none';
+  currentType = category;
+
+  subcategoryButtons.style.display = 'flex';
+  startCamera('user');
+}
+
+// Handle subcategory (Gold/Diamond)
+function selectJewelryType(mainType, subType) {
+  currentType = `${subType}_${mainType}`;
+  subcategoryButtons.style.display = 'none';
+  jewelryOptions.style.display = 'flex';
+  insertJewelryOptions(currentType, 'jewelry-options');
+}
+
+// Insert jewelry options (from Google Drive)
+async function insertJewelryOptions(type, containerId) {
+  const container = document.getElementById(containerId);
+  container.innerHTML = '';
+
+  if (!driveFolders[type]) {
+    console.error("No Google Drive folder mapped for:", type);
+    return;
   }
 
-  // initialize on DOM ready
-  if(document.readyState==='loading'){
-    document.addEventListener('DOMContentLoaded', function(){ startCamera('user'); });
-  } else { startCamera('user'); }
+  const images = await fetchDriveImages(driveFolders[type]);
 
-  // Extra: attempt to make accessing code via view-source less convenient by redirecting if '?src' missing (light deterrent)
-  try{
-    if(!location.search || location.search.indexOf('src=1')===-1){
-      // Do nothing intrusive by default; if you want to enforce: uncomment next line to redirect to same page with src=1
-      // location.replace(location.pathname + '?src=1');
+  images.forEach((file, i) => {
+    const btn = document.createElement('button');
+    const img = document.createElement('img');
+    img.src = file.src;
+    img.alt = `${type.replace('_', ' ')} ${i + 1}`;
+    btn.appendChild(img);
+    btn.onclick = () => changeJewelry(type, file.src);
+    container.appendChild(btn);
+  });
+}
+
+// ================== MEDIAPIPE ==================
+const faceMesh = new FaceMesh({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`,
+});
+faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+
+faceMesh.onResults((results) => {
+  canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+  if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+    const newLandmarks = results.multiFaceLandmarks[0];
+    if (!smoothedFaceLandmarks) {
+      smoothedFaceLandmarks = newLandmarks;
+    } else {
+      const smoothingFactor = 0.2;
+      smoothedFaceLandmarks = smoothedFaceLandmarks.map((prev, i) => ({
+        x: prev.x * (1 - smoothingFactor) + newLandmarks[i].x * smoothingFactor,
+        y: prev.y * (1 - smoothingFactor) + newLandmarks[i].y * smoothingFactor,
+        z: prev.z * (1 - smoothingFactor) + newLandmarks[i].z * smoothingFactor,
+      }));
     }
-  }catch(e){}
-})();
-</script>
-</body></html>
+  } else {
+    smoothedFaceLandmarks = null;
+  }
+  drawJewelry(smoothedFaceLandmarks, canvasCtx);
+});
+
+// Start camera
+async function startCamera(facingMode) {
+  if (camera) camera.stop();
+  camera = new Camera(videoElement, {
+    onFrame: async () => {
+      await faceMesh.send({ image: videoElement });
+    },
+    width: 1280,
+    height: 720,
+    facingMode: facingMode
+  });
+  camera.start();
+}
+
+document.addEventListener('DOMContentLoaded', () => startCamera('user'));
+
+videoElement.addEventListener('loadedmetadata', () => {
+  canvasElement.width = videoElement.videoWidth;
+  canvasElement.height = videoElement.videoHeight;
+});
+
+// =============== Smoothing Helper ==================
+function smoothPoint(prev, current, factor = 0.4) {
+  if (!prev) return current;
+  return {
+    x: prev.x * (1 - factor) + current.x * factor,
+    y: prev.y * (1 - factor) + current.y * factor
+  };
+}
+
+// Draw jewelry
+function drawJewelry(faceLandmarks, ctx) {
+  const earringScale = 0.078;
+  const necklaceScale = 0.252;
+
+  if (faceLandmarks) {
+    const leftEarLandmark = faceLandmarks[132];
+    const rightEarLandmark = faceLandmarks[361];
+    const neckLandmark = faceLandmarks[152];
+
+    let leftEarPos = { x: leftEarLandmark.x * canvasElement.width - 6, y: leftEarLandmark.y * canvasElement.height - 16 };
+    let rightEarPos = { x: rightEarLandmark.x * canvasElement.width + 6, y: rightEarLandmark.y * canvasElement.height - 16 };
+    let neckPos = { x: neckLandmark.x * canvasElement.width - 8, y: neckLandmark.y * canvasElement.height + 10 };
+
+    smoothedFacePoints.leftEar = smoothPoint(smoothedFacePoints.leftEar, leftEarPos);
+    smoothedFacePoints.rightEar = smoothPoint(smoothedFacePoints.rightEar, rightEarPos);
+    smoothedFacePoints.neck = smoothPoint(smoothedFacePoints.neck, neckPos);
+
+    if (earringImg) {
+      const w = earringImg.width * earringScale, h = earringImg.height * earringScale;
+      ctx.drawImage(earringImg, smoothedFacePoints.leftEar.x - w / 2, smoothedFacePoints.leftEar.y, w, h);
+      ctx.drawImage(earringImg, smoothedFacePoints.rightEar.x - w / 2, smoothedFacePoints.rightEar.y, w, h);
+    }
+    if (necklaceImg) {
+      const w = necklaceImg.width * necklaceScale, h = necklaceImg.height * necklaceScale;
+      ctx.drawImage(necklaceImg, smoothedFacePoints.neck.x - w / 2, smoothedFacePoints.neck.y, w, h);
+    }
+  }
+}
+
+// ================= Screenshot & Share =================
+const captureBtn = document.getElementById("capture-btn");
+const screenshotPreview = document.getElementById("screenshot-preview");
+const screenshotLink = document.getElementById("screenshot-link");
+
+captureBtn.addEventListener("click", () => {
+  // Wait until overlay is fully drawn
+  requestAnimationFrame(() => {
+    const screenshotCanvas = document.createElement("canvas");
+    const ctx = screenshotCanvas.getContext("2d");
+    screenshotCanvas.width = videoElement.videoWidth;
+    screenshotCanvas.height = videoElement.videoHeight;
+
+    // Draw webcam frame
+    ctx.drawImage(videoElement, 0, 0, screenshotCanvas.width, screenshotCanvas.height);
+
+    // Draw jewelry overlay
+    ctx.drawImage(canvasElement, 0, 0, screenshotCanvas.width, screenshotCanvas.height);
+
+    // Convert to image
+    const dataUrl = screenshotCanvas.toDataURL("image/png");
+
+    // Show preview (clickable)
+    screenshotPreview.src = dataUrl;
+    screenshotLink.href = dataUrl;
+    screenshotLink.style.display = "block";
+
+    // Download automatically
+    const link = document.createElement("a");
+    link.href = dataUrl;
+    link.download = "my_virtual_jewelry.png";
+    link.click();
+
+    // Web Share API
+    if (navigator.canShare && navigator.canShare({ files: [] })) {
+      screenshotCanvas.toBlob((blob) => {
+        const file = new File([blob], "jewelry.png", { type: "image/png" });
+        navigator.share({
+          files: [file],
+          title: "Virtual Jewelry Try-On",
+          text: "Check out how I look with this jewelry!",
+        }).catch(err => console.log("Share cancelled:", err));
+      });
+    } else {
+      console.log("Web Share not supported. Image downloaded instead.");
+    }
+  });
+});
